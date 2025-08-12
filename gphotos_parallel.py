@@ -21,6 +21,7 @@ This script can also moves metadata from original folder to another. Just in cas
 the JSON, or to exclude them easily.
 """
 import os
+import pathlib
 import json
 import argparse
 import shutil
@@ -31,7 +32,7 @@ from concurrent import futures
 
 LATITUDE_REF = ('N', 'S')
 LONGITUDE_REF = ('E', 'W')
-EXTENSIONS = ['.jpg', '.png', '.heic', '.heif', '.mp4']
+EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.heic', '.heif', '.mp4', '.mov']
 DATETIME_STR_FORMAT = "%Y:%m:%d %H:%M:%S"
 
 
@@ -85,31 +86,9 @@ def normalize_ascii(texto):
         char for char in normalized_text if unicodedata.category(char) != 'Mn'
     )
 
-def try_get_file(dir: str, file: str) -> str:
-    """The "title" metadata field references the file name, but I noticed that,
-    on old media ingested, the extension is missing. This function tries to guess based on common extension.
-    Also, for some photos that are excluded, the respective metadata are still exported, so it is better
-    to check if file really exists."""
-    file_ext = os.path.splitext(file)[1].lower()
-    if file_ext:
-        file_path = os.path.join(dir, file)
-        if not os.path.isfile(file_path):
-            raise Exception(f'File not found: "{file_path}"')
-        return file_path
-    for file_ext in EXTENSIONS:
-        file_path = os.path.join(dir, f"{file}.{file_ext}")
-        if os.path.isfile(file_path):
-            return file_path
-    raise Exception(f'Could not find any extension for file: "{os.path.join(dir, file)}"')
-
-def add_media_metadata(exiftool_exe: str, dir: str, metadata: dict):
+def add_media_metadata(exiftool_exe: str, media_path: str, metadata: dict):
     """Core of the script, adds metadata to file."""
     title = metadata['title']
-    try:
-        file_path = try_get_file(dir, title)
-    except Exception as e:
-        print("[!]", e)
-        return
     cmd = [exiftool_exe, "-overwrite_original"]
     dates = MediaDates(metadata.get('photoTakenTime', {}), metadata.get('creationTime', {}))
     description = metadata.get('description')
@@ -118,23 +97,42 @@ def add_media_metadata(exiftool_exe: str, dir: str, metadata: dict):
         cmd.append(f"-Description={normalize_ascii(description)}")
     cmd += dates.to_params()
     cmd += geo.to_params()
-    cmd.append(file_path)
-    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    cmd.append(media_path)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        return result.stderr.decode()
+    return ""
 
 
-def process_json_file(exiftool_exe: str, metadata_dir: str, dir: str, json_file: str) -> str:
-    metadata_fullpath = os.path.join(dir, json_file)
-    with open(metadata_fullpath, encoding="utf-8") as handle:
-        metadata: dict = json.load(handle)
-    title = metadata.get('title')
-    if title is None or title == last_dir:
-            continue
-        add_media_metadata(exiftool_exe, dir, metadata)
+def prepare_process(base_dir: pathlib.Path, metadata_dir: pathlib.Path):
+    def process_json_file(exiftool_exe: str, json_path: pathlib.Path) -> str:
+        with json_path.open(encoding="utf-8") as handle:
+            metadata: dict = json.load(handle)
+        title: str = metadata.get('title', '')
+        json_dir = json_path.parent
+        if not title or title == json_dir.name:
+            return
+        media_file = json_dir / title
+        # If media file has no extension (some old media has that issue)
+        if not media_file.suffix:
+            # Try all common extension
+            for extension in EXTENSIONS:
+                tmp_media = media_file.with_suffix(extension)
+                if tmp_media.is_file():
+                    media_file = tmp_media
+                    break
+            else:
+                return f'None extension media file found for "{media_file}".'
+        # If media in title has extension, but file not found...
+        elif not media_file.is_file():
+            return f'Media file "{media_file}" not found.'
+        add_media_metadata(exiftool_exe, str(media_file), metadata)
         # Move metadata file to folder
-        if metadata_folder:
-            new_metadata_path = os.path.join(metadata_folder, metadata_fullpath[len(base_dir)+1:])
-            os.makedirs(os.path.dirname(new_metadata_path), exist_ok=True)
-            shutil.move(metadata_fullpath, new_metadata_path)
+        if metadata_dir:
+            new_metadata_path = metadata_dir / json_path.relative_to(base_dir)
+            os.makedirs(new_metadata_path.parent, exist_ok=True)
+            shutil.move(json_path, new_metadata_path)
+    return process_json_file
 
 
 def main():
@@ -144,8 +142,8 @@ def main():
     parser.add_argument("-e", "--exiftool", default="exiftool", help="Exiftool executable path")
     parser.add_argument("-m", "--metadata", help="Directory to move metadata files, once they are processed")
     args = parser.parse_args()
-    base_dir = args.directory.rstrip(os.sep)
-    metadata_folder = args.metadata.rstrip(os.sep)
+    base_dir = pathlib.Path(args.directory)
+    metadata_folder = pathlib.Path(args.metadata)
     exiftool_exe = args.exiftool
     if not os.path.isdir(base_dir):
         print(f"Error! {base_dir} is not a directory!")
@@ -154,21 +152,22 @@ def main():
         if not os.path.isdir(metadata_folder):
             print(f"Error! {metadata_folder} is not a directory!")
             exit(1)
-    json_files: list[tuple[str, str]] = []
-    for dir, _, files in os.walk(base_dir):
-        last_dir = os.path.basename(dir.rstrip(os.path.sep))
-        print(f'[*] Parsing media at "{dir}"')
-        for file in files:
-            if not file.endswith(".json"):
-                continue
-            json_files.append((dir, file))
+    json_files = list(pathlib.Path(base_dir).glob("**/*.json"))
+    last_percent = 0
+    print("[*] 0% complete...")
     with futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-        executions = [executor.submit(process_json_file, exiftool_exe, metadata_folder, dir, file) for dir, file in json_files]
-        for execution in futures.as_completed(executions):
-            result = execution.result()
+        executions = [executor.submit(prepare_process(base_dir, metadata_folder), exiftool_exe, json_path) for json_path in json_files]
+        for i, execution in enumerate(futures.as_completed(executions)):
+            try:
+                result = execution.result()
+            except Exception as e:
+                print(f"[!] {e}")
             if result:
-                print(f"[!] {result}")
-        
+                print(f"[!] Error: {result}")
+            percent = i * 10000 // len(json_files)
+            if percent > last_percent:
+                last_percent = percent
+                print(f"[*] {percent/100:.2f}% complete...")
     print("[+] Done")
 
 

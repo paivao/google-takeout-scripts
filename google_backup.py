@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """This script is created to check if all files you got from an Google Backup are there.
 
 When you export your Google data via "takeout.google.com", generally you get multiple zipped (or tar-gzipped)
@@ -5,7 +6,7 @@ files. To check if all exported files are there, Google creates an HTML file lis
 
 This script check this HTML file and compare with the exported files, after you extract all compressed files.
 
-It needs beautifulsoup. You can get with: "pip install bs4".
+It needs beautifulsoup. You can get with: "pip install beautifulsoup4".
 """
 import os
 import argparse
